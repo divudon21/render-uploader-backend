@@ -62,6 +62,47 @@ app.post('/cleanup', (req, res) => {
     });
 });
 
+app.get('/files', (req, res) => {
+    const tmpDir = os.tmpdir();
+    fs.readdir(tmpDir, (err, files) => {
+        if (err) return res.status(500).json({error: 'Failed to read tmp dir'});
+        const uploadFiles = [];
+        files.forEach(file => {
+            if (file.startsWith('upload_')) {
+                try {
+                    const stat = fs.statSync(path.join(tmpDir, file));
+                    uploadFiles.push({ name: file, size: stat.size });
+                } catch (e) {}
+            }
+        });
+        res.json({ files: uploadFiles });
+    });
+});
+
+app.post('/files/delete', (req, res) => {
+    const { files } = req.body;
+    if (!Array.isArray(files)) return res.status(400).json({error: 'files array required'});
+    
+    const tmpDir = os.tmpdir();
+    let deletedCount = 0;
+    let freedBytes = 0;
+    
+    files.forEach(file => {
+        if (file.startsWith('upload_')) {
+            const p = path.join(tmpDir, file);
+            try {
+                if (fs.existsSync(p)) {
+                    const stat = fs.statSync(p);
+                    freedBytes += stat.size;
+                    fs.unlinkSync(p);
+                    deletedCount++;
+                }
+            } catch (e) {}
+        }
+    });
+    res.json({ success: true, deletedCount, freedBytes });
+});
+
 app.post('/cancel', (req, res) => {
     const { uploadId } = req.body;
     if (uploadId && activeUploads.has(uploadId)) {
