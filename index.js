@@ -12,6 +12,20 @@ app.use(express.json());
 
 const activeUploads = new Map();
 
+async function getFreeProxy() {
+    try {
+        const res = await axios.get('https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=yes&anonymity=all');
+        const proxies = res.data.split('\n').filter(p => p.trim().length > 0);
+        if (proxies.length > 0) {
+            const [host, port] = proxies[0].trim().split(':');
+            return { host, port: parseInt(port) };
+        }
+    } catch (e) {
+        console.error('Failed to fetch proxy');
+    }
+    return null;
+}
+
 app.get('/sysinfo', (req, res) => {
     exec('df -B1 /', (err, stdout) => {
         if (err) return res.status(500).json({error: 'Failed to get disk info'});
@@ -25,44 +39,6 @@ app.get('/sysinfo', (req, res) => {
             res.json({ total: 0, used: 0 });
         }
     });
-});
-
-app.get('/files', (req, res) => {
-    const tmpDir = os.tmpdir();
-    fs.readdir(tmpDir, (err, files) => {
-        if (err) return res.status(500).json({error: 'Failed to read tmp dir'});
-        const uploadFiles = [];
-        files.forEach(file => {
-            if (file.startsWith('upload_')) {
-                const p = path.join(tmpDir, file);
-                try {
-                    const stat = fs.statSync(p);
-                    uploadFiles.push({ name: file, size: stat.size, time: stat.mtimeMs });
-                } catch (e) {}
-            }
-        });
-        res.json({ files: uploadFiles });
-    });
-});
-
-app.post('/delete-files', (req, res) => {
-    const { files } = req.body;
-    if (!Array.isArray(files)) return res.status(400).json({error: 'files array required'});
-    const tmpDir = os.tmpdir();
-    let deletedCount = 0;
-    let freedBytes = 0;
-    files.forEach(file => {
-        if (file.startsWith('upload_')) {
-            const p = path.join(tmpDir, file);
-            try {
-                const stat = fs.statSync(p);
-                freedBytes += stat.size;
-                fs.unlinkSync(p);
-                deletedCount++;
-            } catch (e) {}
-        }
-    });
-    res.json({ success: true, deletedCount, freedBytes });
 });
 
 app.post('/cleanup', (req, res) => {
@@ -99,7 +75,7 @@ app.post('/cancel', (req, res) => {
 });
 
 app.get('/upload-stream', async (req, res) => {
-    const { url, provider, uploadId } = req.query;
+    const { url, provider, uploadId, useProxy } = req.query;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -116,21 +92,40 @@ app.get('/upload-stream', async (req, res) => {
     const abortController = new AbortController();
     activeUploads.set(uploadId, abortController);
 
+    let proxyConfig = false;
+    if (useProxy === 'true') {
+        sendEvent({ stage: 'Fetching Free Proxy...', loaded: 0, total: 0, speed: 0 });
+        const p = await getFreeProxy();
+        if (p) {
+            proxyConfig = p;
+            sendEvent({ stage: `Using Proxy: ${p.host}:${p.port}`, loaded: 0, total: 0, speed: 0 });
+        } else {
+            sendEvent({ stage: 'Proxy fetch failed, using direct connection', loaded: 0, total: 0, speed: 0 });
+        }
+    }
+
     const tempFilePath = path.join(os.tmpdir(), 'upload_' + uuidv4());
     
     try {
         let totalDownloadSize = 0;
+        
+        const headConfig = { signal: abortController.signal, timeout: 10000 };
+        if (proxyConfig) headConfig.proxy = proxyConfig;
+        
         try {
-            const headRes = await axios.head(url, { signal: abortController.signal });
+            const headRes = await axios.head(url, headConfig);
             totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
         } catch (e) {}
 
-        const response = await axios({
+        const downloadConfig = {
             url,
             method: 'GET',
             responseType: 'stream',
             signal: abortController.signal
-        });
+        };
+        if (proxyConfig) downloadConfig.proxy = proxyConfig;
+
+        const response = await axios(downloadConfig);
 
         if (totalDownloadSize === 0) {
             totalDownloadSize = parseInt(response.headers['content-length'] || 0);
@@ -158,7 +153,7 @@ app.get('/upload-stream', async (req, res) => {
             writer.on('error', reject);
             abortController.signal.addEventListener('abort', () => {
                 writer.destroy();
-                reject(new Error('canceled'));
+                reject(new Error('Cancelled'));
             });
         });
 
@@ -174,6 +169,8 @@ app.get('/upload-stream', async (req, res) => {
 
         const uploadConfig = {
             signal: abortController.signal,
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
             onUploadProgress: (progressEvent) => {
                 const now = Date.now();
                 if (now - lastReportTime > 250) {
@@ -183,6 +180,7 @@ app.get('/upload-stream', async (req, res) => {
                 }
             }
         };
+        if (proxyConfig) uploadConfig.proxy = proxyConfig;
 
         if (provider === 'catbox') {
             form.append('reqtype', 'fileupload');
@@ -198,7 +196,9 @@ app.get('/upload-stream', async (req, res) => {
             const uploadRes = await axios.post('https://litterbox.catbox.moe/resources/internals/api.php', form, uploadConfig);
             finalUrl = uploadRes.data;
         } else if (provider === 'gofile') {
-            const serverRes = await axios.get('https://api.gofile.io/servers', { signal: abortController.signal });
+            const serverConfig = { signal: abortController.signal };
+            if (proxyConfig) serverConfig.proxy = proxyConfig;
+            const serverRes = await axios.get('https://api.gofile.io/servers', serverConfig);
             const server = serverRes.data.data.servers[0].name;
             const gofileForm = new FormData();
             gofileForm.append('file', fs.createReadStream(tempFilePath));
@@ -209,13 +209,20 @@ app.get('/upload-stream', async (req, res) => {
             throw new Error('Invalid provider');
         }
 
-        fs.unlinkSync(tempFilePath);
+        // AUTO-DELETE PERMANENTLY FROM SERVER
+        if (fs.existsSync(tempFilePath)) {
+            fs.unlinkSync(tempFilePath);
+        }
+        
         activeUploads.delete(uploadId);
         sendEvent({ stage: 'done', url: finalUrl });
         res.end();
 
     } catch (error) {
-        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        // AUTO-DELETE PERMANENTLY FROM SERVER ON ERROR
+        if (fs.existsSync(tempFilePath)) {
+            fs.unlinkSync(tempFilePath);
+        }
         activeUploads.delete(uploadId);
         sendEvent({ stage: 'error', message: error.message === 'canceled' ? 'Cancelled by user' : (error.message || 'Upload failed') });
         res.end();
