@@ -3,6 +3,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const { exec } = require('child_process');
 
@@ -24,6 +25,27 @@ app.get('/sysinfo', (req, res) => {
     });
 });
 
+app.post('/cleanup', (req, res) => {
+    const tmpDir = os.tmpdir();
+    let deletedCount = 0;
+    let freedBytes = 0;
+    fs.readdir(tmpDir, (err, files) => {
+        if (err) return res.status(500).json({error: 'Failed to read tmp dir'});
+        files.forEach(file => {
+            if (file.startsWith('upload_')) {
+                const p = path.join(tmpDir, file);
+                try {
+                    const stat = fs.statSync(p);
+                    freedBytes += stat.size;
+                    fs.unlinkSync(p);
+                    deletedCount++;
+                } catch (e) {}
+            }
+        });
+        res.json({ success: true, deletedCount, freedBytes });
+    });
+});
+
 app.get('/upload-stream', async (req, res) => {
     const { url, provider } = req.query;
     res.setHeader('Content-Type', 'text/event-stream');
@@ -39,7 +61,7 @@ app.get('/upload-stream', async (req, res) => {
         return res.end();
     }
 
-    const tempFilePath = path.join(__dirname, uuidv4());
+    const tempFilePath = path.join(os.tmpdir(), 'upload_' + uuidv4());
     
     try {
         let totalDownloadSize = 0;
