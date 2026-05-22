@@ -10,6 +10,8 @@ const { exec } = require('child_process');
 const app = express();
 app.use(express.json());
 
+const activeUploads = new Map();
+
 app.get('/sysinfo', (req, res) => {
     exec('df -B1 /', (err, stdout) => {
         if (err) return res.status(500).json({error: 'Failed to get disk info'});
@@ -23,6 +25,44 @@ app.get('/sysinfo', (req, res) => {
             res.json({ total: 0, used: 0 });
         }
     });
+});
+
+app.get('/files', (req, res) => {
+    const tmpDir = os.tmpdir();
+    fs.readdir(tmpDir, (err, files) => {
+        if (err) return res.status(500).json({error: 'Failed to read tmp dir'});
+        const uploadFiles = [];
+        files.forEach(file => {
+            if (file.startsWith('upload_')) {
+                const p = path.join(tmpDir, file);
+                try {
+                    const stat = fs.statSync(p);
+                    uploadFiles.push({ name: file, size: stat.size, time: stat.mtimeMs });
+                } catch (e) {}
+            }
+        });
+        res.json({ files: uploadFiles });
+    });
+});
+
+app.post('/delete-files', (req, res) => {
+    const { files } = req.body;
+    if (!Array.isArray(files)) return res.status(400).json({error: 'files array required'});
+    const tmpDir = os.tmpdir();
+    let deletedCount = 0;
+    let freedBytes = 0;
+    files.forEach(file => {
+        if (file.startsWith('upload_')) {
+            const p = path.join(tmpDir, file);
+            try {
+                const stat = fs.statSync(p);
+                freedBytes += stat.size;
+                fs.unlinkSync(p);
+                deletedCount++;
+            } catch (e) {}
+        }
+    });
+    res.json({ success: true, deletedCount, freedBytes });
 });
 
 app.post('/cleanup', (req, res) => {
@@ -46,8 +86,20 @@ app.post('/cleanup', (req, res) => {
     });
 });
 
+app.post('/cancel', (req, res) => {
+    const { uploadId } = req.body;
+    if (uploadId && activeUploads.has(uploadId)) {
+        const controller = activeUploads.get(uploadId);
+        controller.abort();
+        activeUploads.delete(uploadId);
+        res.json({ success: true, message: 'Upload cancelled' });
+    } else {
+        res.json({ success: false, message: 'Upload ID not found' });
+    }
+});
+
 app.get('/upload-stream', async (req, res) => {
-    const { url, provider } = req.query;
+    const { url, provider, uploadId } = req.query;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -56,24 +108,28 @@ app.get('/upload-stream', async (req, res) => {
         res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
 
-    if (!url || !provider) {
-        sendEvent({ stage: 'error', message: 'Missing url or provider' });
+    if (!url || !provider || !uploadId) {
+        sendEvent({ stage: 'error', message: 'Missing url, provider, or uploadId' });
         return res.end();
     }
+
+    const abortController = new AbortController();
+    activeUploads.set(uploadId, abortController);
 
     const tempFilePath = path.join(os.tmpdir(), 'upload_' + uuidv4());
     
     try {
         let totalDownloadSize = 0;
         try {
-            const headRes = await axios.head(url);
+            const headRes = await axios.head(url, { signal: abortController.signal });
             totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
         } catch (e) {}
 
         const response = await axios({
             url,
             method: 'GET',
-            responseType: 'stream'
+            responseType: 'stream',
+            signal: abortController.signal
         });
 
         if (totalDownloadSize === 0) {
@@ -100,6 +156,10 @@ app.get('/upload-stream', async (req, res) => {
         await new Promise((resolve, reject) => {
             writer.on('finish', resolve);
             writer.on('error', reject);
+            abortController.signal.addEventListener('abort', () => {
+                writer.destroy();
+                reject(new Error('canceled'));
+            });
         });
 
         sendEvent({ stage: 'Downloading to Server', loaded: downloadedBytes, total: totalDownloadSize || downloadedBytes, speed: 0 });
@@ -113,6 +173,7 @@ app.get('/upload-stream', async (req, res) => {
         lastReportTime = Date.now();
 
         const uploadConfig = {
+            signal: abortController.signal,
             onUploadProgress: (progressEvent) => {
                 const now = Date.now();
                 if (now - lastReportTime > 250) {
@@ -137,7 +198,7 @@ app.get('/upload-stream', async (req, res) => {
             const uploadRes = await axios.post('https://litterbox.catbox.moe/resources/internals/api.php', form, uploadConfig);
             finalUrl = uploadRes.data;
         } else if (provider === 'gofile') {
-            const serverRes = await axios.get('https://api.gofile.io/servers');
+            const serverRes = await axios.get('https://api.gofile.io/servers', { signal: abortController.signal });
             const server = serverRes.data.data.servers[0].name;
             const gofileForm = new FormData();
             gofileForm.append('file', fs.createReadStream(tempFilePath));
@@ -149,12 +210,14 @@ app.get('/upload-stream', async (req, res) => {
         }
 
         fs.unlinkSync(tempFilePath);
+        activeUploads.delete(uploadId);
         sendEvent({ stage: 'done', url: finalUrl });
         res.end();
 
     } catch (error) {
         if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-        sendEvent({ stage: 'error', message: error.message || 'Upload failed' });
+        activeUploads.delete(uploadId);
+        sendEvent({ stage: 'error', message: error.message === 'canceled' ? 'Cancelled by user' : (error.message || 'Upload failed') });
         res.end();
     }
 });
