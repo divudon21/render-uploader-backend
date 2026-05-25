@@ -16,14 +16,12 @@ const abortControllers = new Map();
 setInterval(() => {
     const now = Date.now();
     activeUploads.forEach((value, key) => {
-        // Leave completed downloads in memory for 2 hours so app can see 'done' status
         if (value.status === 'done' || value.status === 'error' || value.status === 'Cancelled by user') {
             if (value._startTime && now - value._startTime > 2 * 60 * 60 * 1000) {
                 activeUploads.delete(key);
                 abortControllers.delete(key);
             }
         } else {
-            // If starting/downloading and no activity for 3 hours, clean up
             if (value._startTime && now - value._startTime > 3 * 60 * 60 * 1000) {
                 activeUploads.delete(key);
                 abortControllers.delete(key);
@@ -116,8 +114,14 @@ app.post('/cancel', (req, res) => {
         activeUploads.set(uploadId, { status: 'error', message: 'Cancelled by user', _startTime: Date.now() });
         
         // Permanently delete file immediately
-        const p = path.join(os.tmpdir(), 'upload_' + uploadId);
-        try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch(e) {}
+        const tmpDir = os.tmpdir();
+        try {
+            fs.readdirSync(tmpDir).forEach(file => {
+                if (file.startsWith('upload_' + uploadId)) {
+                    fs.unlinkSync(path.join(tmpDir, file));
+                }
+            });
+        } catch(e) {}
         
         res.json({ success: true });
     } else {
@@ -136,11 +140,11 @@ app.get('/status', (req, res) => {
     }
 });
 
-// Serve downloaded files
+// Serve downloaded files (res.sendFile supports Range headers out of the box for video streaming / resume)
 app.get('/f/:filename', (req, res) => {
     const p = path.join(os.tmpdir(), req.params.filename);
     if (fs.existsSync(p)) {
-        res.download(p);
+        res.sendFile(p);
     } else {
         res.status(404).send('File not found or expired');
     }
@@ -158,7 +162,7 @@ function getFilenameFromUrl(url, headers) {
         const last = parts[parts.length - 1];
         if (last && last.includes('.')) return decodeURIComponent(last);
     } catch(e) {}
-    return 'uploaded_file';
+    return null;
 }
 
 app.post('/start-upload', async (req, res) => {
@@ -173,7 +177,7 @@ app.post('/start-upload', async (req, res) => {
     res.json({ uploadId });
 
     (async () => {
-        const tempFilePath = path.join(os.tmpdir(), 'upload_' + uploadId);
+        let tempFilePath = '';
         try {
             let totalDownloadSize = 0;
             let downloadHeaders = {};
@@ -204,7 +208,18 @@ app.post('/start-upload', async (req, res) => {
 
             if (totalDownloadSize === 0) totalDownloadSize = parseInt(response.headers['content-length'] || 0);
             if (!downloadHeaders['content-disposition']) downloadHeaders = response.headers;
-            const filename = getFilenameFromUrl(url, downloadHeaders);
+            
+            let originalFilename = getFilenameFromUrl(url, downloadHeaders);
+            if (!originalFilename) {
+                const ct = response.headers['content-type'] || '';
+                if (ct.includes('video/mp4')) originalFilename = 'video.mp4';
+                else if (ct.includes('video/x-matroska')) originalFilename = 'video.mkv';
+                else if (ct.includes('application/zip')) originalFilename = 'file.zip';
+                else originalFilename = 'file.bin';
+            }
+            const safeFilename = originalFilename.replace(/[^a-zA-Z0-9.-]/g, '_');
+            const actualFileName = `upload_${uploadId}_${safeFilename}`;
+            tempFilePath = path.join(os.tmpdir(), actualFileName);
 
             let downloadedBytes = 0;
             let startTime = Date.now();
@@ -233,15 +248,15 @@ app.post('/start-upload', async (req, res) => {
             });
 
             const fileSize = fs.statSync(tempFilePath).size;
-            console.log(`Downloaded ${filename} successfully (${fileSize} bytes) and stored locally.`);
+            console.log(`Downloaded ${actualFileName} successfully (${fileSize} bytes) and stored locally.`);
 
             // Link generation & success
-            const fileUrl = `${req.protocol}://${req.get('host')}/f/upload_${uploadId}`;
-            activeUploads.set(uploadId, { status: 'done', filename: 'upload_' + uploadId, size: fileSize, fileUrl: fileUrl, _startTime: Date.now() });
+            const fileUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
+            activeUploads.set(uploadId, { status: 'done', filename: actualFileName, size: fileSize, fileUrl: fileUrl, _startTime: Date.now() });
             abortControllers.delete(uploadId);
 
         } catch (error) {
-            try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch(e) {}
+            try { if (tempFilePath && fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch(e) {}
             const msg = error.message === 'canceled' ? 'Cancelled by user' : (error.message || 'Download failed');
             console.error(`Download error: ${msg}`);
             activeUploads.set(uploadId, { status: 'error', message: msg, _startTime: Date.now() });
