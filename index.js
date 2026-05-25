@@ -12,15 +12,33 @@ app.use(express.json());
 const activeUploads = new Map();
 const abortControllers = new Map();
 
-// Keep alive & internal memory cleanup
+// Keep alive & internal memory cleanup + 24h auto-delete
 setInterval(() => {
+    const now = Date.now();
     activeUploads.forEach((value, key) => {
-        // Clean up stale downloads older than 30 minutes
-        if (value._startTime && Date.now() - value._startTime > 30 * 60 * 1000) {
+        // Clean up stale downloads older than 30 minutes from memory
+        if (value._startTime && now - value._startTime > 30 * 60 * 1000 && value.status !== 'done') {
             activeUploads.delete(key);
             abortControllers.delete(key);
         }
     });
+
+    // 24 hours file auto-delete
+    const tmpDir = os.tmpdir();
+    try {
+        fs.readdirSync(tmpDir).forEach(file => {
+            if (file.startsWith('upload_')) {
+                const p = path.join(tmpDir, file);
+                try {
+                    const stats = fs.statSync(p);
+                    if (now - stats.mtimeMs > 24 * 60 * 60 * 1000) {
+                        fs.unlinkSync(p);
+                        console.log(`Auto-deleted file older than 24h: ${file}`);
+                    }
+                } catch(e) {}
+            }
+        });
+    } catch(e) {}
 }, 60000);
 
 app.get('/sysinfo', (req, res) => {
@@ -88,6 +106,11 @@ app.post('/cancel', (req, res) => {
         abortControllers.get(uploadId).abort();
         abortControllers.delete(uploadId);
         activeUploads.set(uploadId, { status: 'error', message: 'Cancelled by user' });
+        
+        // Permanently delete file immediately
+        const p = path.join(os.tmpdir(), 'upload_' + uploadId);
+        try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch(e) {}
+        
         res.json({ success: true });
     } else {
         res.json({ success: false, message: 'Not found' });
@@ -102,6 +125,16 @@ app.get('/status', (req, res) => {
         res.json(data);
     } else {
         res.status(404).json({ error: 'Not found' });
+    }
+});
+
+// Serve downloaded files
+app.get('/f/:filename', (req, res) => {
+    const p = path.join(os.tmpdir(), req.params.filename);
+    if (fs.existsSync(p)) {
+        res.download(p);
+    } else {
+        res.status(404).send('File not found or expired');
     }
 });
 
@@ -194,12 +227,12 @@ app.post('/start-upload', async (req, res) => {
             const fileSize = fs.statSync(tempFilePath).size;
             console.log(`Downloaded ${filename} successfully (${fileSize} bytes) and stored locally.`);
 
-            // Terminal download success configuration
-            activeUploads.set(uploadId, { status: 'done', filename: 'upload_' + uploadId, size: fileSize });
+            // Link generation & success
+            const fileUrl = `${req.protocol}://${req.get('host')}/f/upload_${uploadId}`;
+            activeUploads.set(uploadId, { status: 'done', filename: 'upload_' + uploadId, size: fileSize, fileUrl: fileUrl });
             abortControllers.delete(uploadId);
 
         } catch (error) {
-            // Keep the partial file cleanup mechanism intact on crash/cancel
             try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch(e) {}
             const msg = error.message === 'canceled' ? 'Cancelled by user' : (error.message || 'Download failed');
             console.error(`Download error: ${msg}`);
