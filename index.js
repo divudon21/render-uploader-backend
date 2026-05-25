@@ -29,7 +29,6 @@ setInterval(() => {
         }
     });
 
-    // 24 hours file auto-delete
     const tmpDir = os.tmpdir();
     try {
         fs.readdirSync(tmpDir).forEach(file => {
@@ -114,7 +113,6 @@ app.post('/cancel', (req, res) => {
         const currentData = activeUploads.get(uploadId) || {};
         activeUploads.set(uploadId, { ...currentData, status: 'error', message: 'Cancelled by user', _startTime: Date.now(), speed: 0 });
         
-        // Permanently delete file immediately
         const tmpDir = os.tmpdir();
         try {
             fs.readdirSync(tmpDir).forEach(file => {
@@ -214,33 +212,10 @@ app.post('/start-upload', async (req, res) => {
             let totalDownloadSize = 0;
             let downloadHeaders = {};
             try {
-                // Try HEAD request first
-                const headRes = await axios.head(url, { 
-                    signal: abortController.signal, 
-                    timeout: 30000,
-                    headers: useProxy ? {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Accept': '*/*'
-                    } : {}
-                });
+                const headRes = await axios.head(url, { signal: abortController.signal, timeout: 30000 });
                 totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
                 downloadHeaders = headRes.headers;
-            } catch (e) {
-                // If HEAD fails (some servers block it), try a GET request and abort it immediately
-                try {
-                    const getRes = await axios.get(url, {
-                        responseType: 'stream',
-                        timeout: 30000,
-                        headers: useProxy ? {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            'Accept': '*/*'
-                        } : {}
-                    });
-                    totalDownloadSize = parseInt(getRes.headers['content-length'] || 0);
-                    downloadHeaders = getRes.headers;
-                    getRes.data.destroy(); // Abort the stream immediately
-                } catch (err) {}
-            }
+            } catch (e) { }
 
             let originalFilename = getFilenameFromUrl(url, downloadHeaders);
             if (!originalFilename) {
@@ -257,25 +232,28 @@ app.post('/start-upload', async (req, res) => {
             let startTime = Date.now();
             activeUploads.set(uploadId, { url: url, status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: startTime });
 
-            const wgetArgs = [
-                '-c', 
-                '-t', '10', 
-                '--waitretry=2', 
-                '-O', tempFilePath 
+            const curlArgs = [
+                '-L', // Follow redirects
+                '-C', '-', // Resume broken downloads
+                '--retry', '10', // Retry 10 times
+                '--retry-delay', '2',
+                '--max-time', '0', // No timeout
+                '-o', tempFilePath
             ];
 
             if (useProxy) {
-                wgetArgs.push('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+                curlArgs.push('-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 try {
-                    wgetArgs.push(`--referer=${new URL(url).origin}/`);
+                    curlArgs.push('-H', `Referer: ${new URL(url).origin}/`);
                 } catch(e) {}
             }
             
-            wgetArgs.push(url);
+            curlArgs.push(url);
 
+            // Create empty file so progress checker works
             fs.writeFileSync(tempFilePath, '');
 
-            const wgetProcess = spawn('wget', wgetArgs);
+            const curlProcess = spawn('curl', curlArgs);
 
             let lastReportTime = Date.now();
             let lastLoaded = 0;
@@ -288,7 +266,7 @@ app.post('/start-upload', async (req, res) => {
                         const now = Date.now();
                         const elapsedSec = (now - lastReportTime) / 1000;
                         
-                        if (elapsedSec > 0) {
+                        if (elapsedSec >= 0.5) { // update every half second
                             const bytesDiff = loaded - lastLoaded;
                             if (bytesDiff >= 0) {
                                 const currentSpeed = bytesDiff / elapsedSec;
@@ -310,22 +288,22 @@ app.post('/start-upload', async (req, res) => {
                         }
                     }
                 } catch(e) {}
-            }, 1000);
+            }, 500);
 
             abortController.signal.addEventListener('abort', () => {
-                wgetProcess.kill('SIGKILL');
+                curlProcess.kill('SIGKILL');
             });
 
             await new Promise((resolve, reject) => {
-                wgetProcess.on('close', (code) => {
+                curlProcess.on('close', (code) => {
                     clearInterval(progressInterval);
-                    if (code === 0) {
+                    if (code === 0 || code === 33) { // 33 is HTTP range error (already downloaded)
                         resolve();
                     } else {
-                        reject(new Error(`Download failed (wget exit code ${code})`));
+                        reject(new Error(`Download failed (curl exit code ${code})`));
                     }
                 });
-                wgetProcess.on('error', (err) => {
+                curlProcess.on('error', (err) => {
                     clearInterval(progressInterval);
                     reject(err);
                 });
