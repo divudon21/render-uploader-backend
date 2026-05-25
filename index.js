@@ -227,6 +227,7 @@ app.post('/start-upload', async (req, res) => {
 
             let lastReportTime = Date.now();
             let lastLoaded = 0;
+            let speedBuffer = [];
 
             const progressInterval = setInterval(() => {
                 try {
@@ -234,35 +235,34 @@ app.post('/start-upload', async (req, res) => {
                         const loaded = fs.statSync(tempFilePath).size;
                         const now = Date.now();
                         const elapsedSec = (now - lastReportTime) / 1000;
-                        let speed = 0;
-                        if (elapsedSec > 0 && loaded >= lastLoaded) {
-                            speed = (loaded - lastLoaded) / elapsedSec;
-                        }
                         
-                        // Prevent speed from dropping to 0 artificially if stat size hasn't updated in OS buffer
-                        if (speed > 0) {
+                        if (elapsedSec > 0) {
+                            const bytesDiff = loaded - lastLoaded;
+                            if (bytesDiff >= 0) {
+                                const currentSpeed = bytesDiff / elapsedSec;
+                                
+                                // Maintain a sliding window of 5 speed samples to smooth it out
+                                speedBuffer.push(currentSpeed);
+                                if (speedBuffer.length > 5) speedBuffer.shift();
+                                
+                                // Calculate average speed
+                                const avgSpeed = speedBuffer.reduce((a, b) => a + b, 0) / speedBuffer.length;
+                                
+                                activeUploads.set(uploadId, { 
+                                    status: 'Downloading to Server', 
+                                    loaded: loaded, 
+                                    total: totalDownloadSize || loaded, 
+                                    speed: avgSpeed, 
+                                    _startTime: startTime 
+                                });
+                            }
+                            
                             lastLoaded = loaded;
                             lastReportTime = now;
-                            
-                            activeUploads.set(uploadId, { 
-                                status: 'Downloading to Server', 
-                                loaded: loaded, 
-                                total: totalDownloadSize || loaded, // fallback to loaded if total is unknown
-                                speed: speed, 
-                                _startTime: startTime 
-                            });
-                        } else {
-                            // Just update loaded but keep previous speed for smooth UI
-                            const currentData = activeUploads.get(uploadId);
-                            activeUploads.set(uploadId, { 
-                                ...currentData,
-                                loaded: loaded,
-                                total: totalDownloadSize || loaded
-                            });
                         }
                     }
                 } catch(e) {}
-            }, 500);
+            }, 1000); // Polling every 1s
 
             abortController.signal.addEventListener('abort', () => {
                 wgetProcess.kill('SIGKILL');
