@@ -29,7 +29,6 @@ setInterval(() => {
         }
     });
 
-    // 24 hours file auto-delete
     const tmpDir = os.tmpdir();
     try {
         fs.readdirSync(tmpDir).forEach(file => {
@@ -111,9 +110,9 @@ app.post('/cancel', (req, res) => {
     if (uploadId && abortControllers.has(uploadId)) {
         abortControllers.get(uploadId).abort();
         abortControllers.delete(uploadId);
-        activeUploads.set(uploadId, { status: 'error', message: 'Cancelled by user', _startTime: Date.now() });
+        const currentData = activeUploads.get(uploadId) || {};
+        activeUploads.set(uploadId, { ...currentData, status: 'error', message: 'Cancelled by user', _startTime: Date.now(), speed: 0 });
         
-        // Permanently delete file immediately
         const tmpDir = os.tmpdir();
         try {
             fs.readdirSync(tmpDir).forEach(file => {
@@ -129,6 +128,38 @@ app.post('/cancel', (req, res) => {
     }
 });
 
+app.post('/cancel-all', (req, res) => {
+    activeUploads.forEach((value, key) => {
+        if (value.status !== 'done' && value.status !== 'error' && value.status !== 'Cancelled by user' && value.message !== 'Cancelled by user') {
+            if (abortControllers.has(key)) {
+                try { abortControllers.get(key).abort(); } catch(e) {}
+                abortControllers.delete(key);
+            }
+            activeUploads.set(key, { ...value, status: 'error', message: 'Cancelled by user', speed: 0 });
+            
+            const tmpDir = os.tmpdir();
+            try {
+                fs.readdirSync(tmpDir).forEach(file => {
+                    if (file.startsWith('upload_' + key)) {
+                        fs.unlinkSync(path.join(tmpDir, file));
+                    }
+                });
+            } catch(e) {}
+        }
+    });
+    res.json({ success: true });
+});
+
+app.get('/active-tasks', (req, res) => {
+    const tasks = [];
+    activeUploads.forEach((value, key) => {
+        const data = { ...value };
+        delete data._startTime;
+        tasks.push({ id: key, ...data });
+    });
+    res.json({ tasks: tasks.reverse() });
+});
+
 app.get('/status', (req, res) => {
     const { uploadId } = req.query;
     if (activeUploads.has(uploadId)) {
@@ -140,7 +171,6 @@ app.get('/status', (req, res) => {
     }
 });
 
-// Serve downloaded files (res.sendFile supports Range headers out of the box for video streaming / resume)
 app.get('/f/:filename', (req, res) => {
     const p = path.join(os.tmpdir(), req.params.filename);
     if (fs.existsSync(p)) {
@@ -170,7 +200,7 @@ app.post('/start-upload', async (req, res) => {
     if (!url) return res.status(400).json({error: 'Missing params'});
 
     const uploadId = uuidv4();
-    activeUploads.set(uploadId, { status: 'Starting', loaded: 0, total: 0, speed: 0, _startTime: Date.now() });
+    activeUploads.set(uploadId, { url: url, status: 'Starting', loaded: 0, total: 0, speed: 0, _startTime: Date.now() });
     const abortController = new AbortController();
     abortControllers.set(uploadId, abortController);
 
@@ -182,11 +212,10 @@ app.post('/start-upload', async (req, res) => {
             let totalDownloadSize = 0;
             let downloadHeaders = {};
             try {
-                // Wait for headers to get total size
                 const headRes = await axios.head(url, { signal: abortController.signal, timeout: 30000 });
                 totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
                 downloadHeaders = headRes.headers;
-            } catch (e) { /* HEAD may fail, continue */ }
+            } catch (e) { }
 
             let originalFilename = getFilenameFromUrl(url, downloadHeaders);
             if (!originalFilename) {
@@ -201,14 +230,13 @@ app.post('/start-upload', async (req, res) => {
             tempFilePath = path.join(os.tmpdir(), actualFileName);
 
             let startTime = Date.now();
-            // Important: Pre-set the total size so the UI knows the bounds
-            activeUploads.set(uploadId, { status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: startTime });
+            activeUploads.set(uploadId, { url: url, status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: startTime });
 
             const wgetArgs = [
-                '-c', // Continue getting a partially-downloaded file
-                '-t', '10', // Retry 10 times
-                '--waitretry=2', // Wait 2s between retries
-                '-O', tempFilePath // Output file
+                '-c', 
+                '-t', '10', 
+                '--waitretry=2', 
+                '-O', tempFilePath 
             ];
 
             if (useProxy) {
@@ -220,7 +248,6 @@ app.post('/start-upload', async (req, res) => {
             
             wgetArgs.push(url);
 
-            // Create an empty file first so fs.statSync doesn't fail immediately
             fs.writeFileSync(tempFilePath, '');
 
             const wgetProcess = spawn('wget', wgetArgs);
@@ -240,15 +267,12 @@ app.post('/start-upload', async (req, res) => {
                             const bytesDiff = loaded - lastLoaded;
                             if (bytesDiff >= 0) {
                                 const currentSpeed = bytesDiff / elapsedSec;
-                                
-                                // Maintain a sliding window of 5 speed samples to smooth it out
                                 speedBuffer.push(currentSpeed);
                                 if (speedBuffer.length > 5) speedBuffer.shift();
-                                
-                                // Calculate average speed
                                 const avgSpeed = speedBuffer.reduce((a, b) => a + b, 0) / speedBuffer.length;
                                 
                                 activeUploads.set(uploadId, { 
+                                    url: url,
                                     status: 'Downloading to Server', 
                                     loaded: loaded, 
                                     total: totalDownloadSize || loaded, 
@@ -256,13 +280,12 @@ app.post('/start-upload', async (req, res) => {
                                     _startTime: startTime 
                                 });
                             }
-                            
                             lastLoaded = loaded;
                             lastReportTime = now;
                         }
                     }
                 } catch(e) {}
-            }, 1000); // Polling every 1s
+            }, 1000);
 
             abortController.signal.addEventListener('abort', () => {
                 wgetProcess.kill('SIGKILL');
@@ -286,18 +309,14 @@ app.post('/start-upload', async (req, res) => {
             const fileSize = fs.existsSync(tempFilePath) ? fs.statSync(tempFilePath).size : 0;
             if (fileSize === 0) throw new Error('Downloaded file is empty or failed');
 
-            console.log(`Downloaded ${actualFileName} successfully (${fileSize} bytes) and stored locally.`);
-
-            // Link generation & success
             const fileUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
-            activeUploads.set(uploadId, { status: 'done', filename: actualFileName, size: fileSize, fileUrl: fileUrl, _startTime: Date.now() });
+            activeUploads.set(uploadId, { url: url, status: 'done', filename: actualFileName, size: fileSize, fileUrl: fileUrl, _startTime: Date.now() });
             abortControllers.delete(uploadId);
 
         } catch (error) {
             try { if (tempFilePath && fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch(e) {}
             const msg = error.message === 'canceled' ? 'Cancelled by user' : (error.message || 'Download failed');
-            console.error(`Download error: ${msg}`);
-            activeUploads.set(uploadId, { status: 'error', message: msg, _startTime: Date.now() });
+            activeUploads.set(uploadId, { url: url, status: 'error', message: msg, _startTime: Date.now(), speed: 0 });
             abortControllers.delete(uploadId);
         }
     })();
