@@ -209,38 +209,20 @@ app.post('/start-upload', async (req, res) => {
     (async () => {
         let tempFilePath = '';
         try {
-            let actualUrl = url;
-            
-            // Handle GoFile and other direct download links by checking for redirects
-            try {
-                const checkRes = await axios.head(url, { 
-                    maxRedirects: 0, 
-                    validateStatus: status => status >= 200 && status < 400 
-                });
-                if (checkRes.headers && checkRes.headers.location) {
-                    actualUrl = checkRes.headers.location;
-                }
-            } catch(e) {
-                if (e.response && e.response.headers && e.response.headers.location) {
-                    actualUrl = e.response.headers.location;
-                }
-            }
-
             let totalDownloadSize = 0;
             let downloadHeaders = {};
             try {
-                const headRes = await axios.head(actualUrl, { signal: abortController.signal, timeout: 30000 });
+                const headRes = await axios.head(url, { signal: abortController.signal, timeout: 30000 });
                 totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
                 downloadHeaders = headRes.headers;
             } catch (e) { }
 
-            let originalFilename = getFilenameFromUrl(actualUrl, downloadHeaders);
+            let originalFilename = getFilenameFromUrl(url, downloadHeaders);
             if (!originalFilename) {
                 const ct = downloadHeaders['content-type'] || '';
                 if (ct.includes('video/mp4')) originalFilename = 'video.mp4';
                 else if (ct.includes('video/x-matroska')) originalFilename = 'video.mkv';
                 else if (ct.includes('application/zip')) originalFilename = 'file.zip';
-                else if (ct.includes('application/vnd.android.package-archive')) originalFilename = 'app.apk';
                 else originalFilename = 'file.bin';
             }
             const safeFilename = originalFilename.replace(/[^a-zA-Z0-9.-]/g, '_');
@@ -257,19 +239,14 @@ app.post('/start-upload', async (req, res) => {
                 '-O', tempFilePath 
             ];
 
-            // For GoFile we must send a fake User-Agent and follow cookies if any
-            wgetArgs.push('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-            if (actualUrl.includes('gofile.io')) {
-                wgetArgs.push('--header=Cookie: accountToken=guest');
-            }
-            
             if (useProxy) {
+                wgetArgs.push('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 try {
-                    wgetArgs.push(`--referer=${new URL(actualUrl).origin}/`);
+                    wgetArgs.push(`--referer=${new URL(url).origin}/`);
                 } catch(e) {}
             }
             
-            wgetArgs.push(actualUrl);
+            wgetArgs.push(url);
 
             fs.writeFileSync(tempFilePath, '');
 
@@ -330,19 +307,6 @@ app.post('/start-upload', async (req, res) => {
             });
 
             const fileSize = fs.existsSync(tempFilePath) ? fs.statSync(tempFilePath).size : 0;
-            
-            // If the file is just an HTML page (like a GoFile block page), it failed
-            if (fileSize < 100000) { // Less than 100KB, check if it's HTML
-                try {
-                    const content = fs.readFileSync(tempFilePath, 'utf8');
-                    if (content.includes('<!DOCTYPE html>') || content.includes('<html')) {
-                        throw new Error('Received HTML instead of file. Link might be protected or expired.');
-                    }
-                } catch(e) {
-                    if (e.message.includes('Received HTML')) throw e;
-                }
-            }
-            
             if (fileSize === 0) throw new Error('Downloaded file is empty or failed');
 
             const fileUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
