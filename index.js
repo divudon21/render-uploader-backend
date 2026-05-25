@@ -189,7 +189,7 @@ app.post('/start-upload', async (req, res) => {
 
             const downloadConfig = {
                 url, method: 'GET', responseType: 'stream',
-                signal: abortController.signal, timeout: 600000,
+                signal: abortController.signal, timeout: 0, maxContentLength: Infinity, maxBodyLength: Infinity,
                 maxRedirects: 10
             };
 
