@@ -212,9 +212,30 @@ app.post('/start-upload', async (req, res) => {
             let totalDownloadSize = 0;
             let downloadHeaders = {};
             try {
-                const headRes = await axios.head(url, { signal: abortController.signal, timeout: 30000 });
-                totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
-                downloadHeaders = headRes.headers;
+                // Use curl -sI to get headers reliably, even for Cloudflare/R2 links
+                const curlHeadArgs = ['-sI', '-L', url];
+                if (useProxy) {
+                    curlHeadArgs.push('-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+                }
+                const headResult = await new Promise((resolve) => {
+                    exec('curl ' + curlHeadArgs.join(' '), (err, stdout) => {
+                        resolve(stdout || '');
+                    });
+                });
+                
+                const lines = headResult.split('\n');
+                lines.forEach(line => {
+                    const l = line.toLowerCase();
+                    if (l.startsWith('content-length:')) {
+                        totalDownloadSize = parseInt(l.split(':')[1].trim()) || 0;
+                    }
+                    if (l.startsWith('content-type:')) {
+                        downloadHeaders['content-type'] = l.split(':')[1].trim();
+                    }
+                    if (l.startsWith('content-disposition:')) {
+                        downloadHeaders['content-disposition'] = l.split(':')[1].trim();
+                    }
+                });
             } catch (e) { }
 
             let originalFilename = getFilenameFromUrl(url, downloadHeaders);
