@@ -182,6 +182,7 @@ app.post('/start-upload', async (req, res) => {
             let totalDownloadSize = 0;
             let downloadHeaders = {};
             try {
+                // Wait for headers to get total size
                 const headRes = await axios.head(url, { signal: abortController.signal, timeout: 30000 });
                 totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
                 downloadHeaders = headRes.headers;
@@ -200,10 +201,9 @@ app.post('/start-upload', async (req, res) => {
             tempFilePath = path.join(os.tmpdir(), actualFileName);
 
             let startTime = Date.now();
+            // Important: Pre-set the total size so the UI knows the bounds
             activeUploads.set(uploadId, { status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: startTime });
 
-            // Using wget because it's extremely memory efficient for large files and writes directly to disk
-            // It completely bypasses Node.js memory limits.
             const wgetArgs = [
                 '-c', // Continue getting a partially-downloaded file
                 '-t', '10', // Retry 10 times
@@ -220,6 +220,9 @@ app.post('/start-upload', async (req, res) => {
             
             wgetArgs.push(url);
 
+            // Create an empty file first so fs.statSync doesn't fail immediately
+            fs.writeFileSync(tempFilePath, '');
+
             const wgetProcess = spawn('wget', wgetArgs);
 
             let lastReportTime = Date.now();
@@ -235,19 +238,31 @@ app.post('/start-upload', async (req, res) => {
                         if (elapsedSec > 0 && loaded >= lastLoaded) {
                             speed = (loaded - lastLoaded) / elapsedSec;
                         }
-                        lastLoaded = loaded;
-                        lastReportTime = now;
                         
-                        activeUploads.set(uploadId, { 
-                            status: 'Downloading to Server', 
-                            loaded: loaded, 
-                            total: totalDownloadSize || loaded, // fallback to loaded if total is unknown
-                            speed: speed, 
-                            _startTime: startTime 
-                        });
+                        // Prevent speed from dropping to 0 artificially if stat size hasn't updated in OS buffer
+                        if (speed > 0) {
+                            lastLoaded = loaded;
+                            lastReportTime = now;
+                            
+                            activeUploads.set(uploadId, { 
+                                status: 'Downloading to Server', 
+                                loaded: loaded, 
+                                total: totalDownloadSize || loaded, // fallback to loaded if total is unknown
+                                speed: speed, 
+                                _startTime: startTime 
+                            });
+                        } else {
+                            // Just update loaded but keep previous speed for smooth UI
+                            const currentData = activeUploads.get(uploadId);
+                            activeUploads.set(uploadId, { 
+                                ...currentData,
+                                loaded: loaded,
+                                total: totalDownloadSize || loaded
+                            });
+                        }
                     }
                 } catch(e) {}
-            }, 1000); // Polling every 1s instead of 500ms to save CPU
+            }, 500);
 
             abortController.signal.addEventListener('abort', () => {
                 wgetProcess.kill('SIGKILL');
