@@ -173,10 +173,52 @@ app.get('/status', (req, res) => {
 
 app.get('/f/:filename', (req, res) => {
     const p = path.join(os.tmpdir(), req.params.filename);
-    if (fs.existsSync(p)) {
-        res.sendFile(p);
+    if (!fs.existsSync(p)) {
+        return res.status(404).send('File not found or expired');
+    }
+    
+    if (req.query.download === 'true') {
+        return res.download(p);
+    }
+
+    const stat = fs.statSync(p);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    let contentType = 'application/octet-stream';
+    if (req.params.filename.endsWith('.mp4')) contentType = 'video/mp4';
+    else if (req.params.filename.endsWith('.mkv')) contentType = 'video/x-matroska';
+    else if (req.params.filename.endsWith('.webm')) contentType = 'video/webm';
+
+    if (range) {
+        const parts = range.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+        if (start >= fileSize) {
+            res.status(416).send('Requested range not satisfiable\n'+start+' >= '+fileSize);
+            return;
+        }
+
+        const chunksize = (end - start) + 1;
+        const file = fs.createReadStream(p, {start, end});
+        const head = {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunksize,
+            'Content-Type': contentType,
+        };
+
+        res.writeHead(206, head);
+        file.pipe(res);
     } else {
-        res.status(404).send('File not found or expired');
+        const head = {
+            'Content-Length': fileSize,
+            'Content-Type': contentType,
+            'Accept-Ranges': 'bytes'
+        };
+        res.writeHead(200, head);
+        fs.createReadStream(p).pipe(res);
     }
 });
 
@@ -232,28 +274,25 @@ app.post('/start-upload', async (req, res) => {
             let startTime = Date.now();
             activeUploads.set(uploadId, { url: url, status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: startTime });
 
-            const curlArgs = [
-                '-L', // Follow redirects
-                '-C', '-', // Resume broken downloads
-                '--retry', '10', // Retry 10 times
-                '--retry-delay', '2',
-                '--max-time', '0', // No timeout
-                '-o', tempFilePath
+            const wgetArgs = [
+                '-c', 
+                '-t', '10', 
+                '--waitretry=2', 
+                '-O', tempFilePath 
             ];
 
             if (useProxy) {
-                curlArgs.push('-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+                wgetArgs.push('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 try {
-                    curlArgs.push('-H', `Referer: ${new URL(url).origin}/`);
+                    wgetArgs.push(`--referer=${new URL(url).origin}/`);
                 } catch(e) {}
             }
             
-            curlArgs.push(url);
+            wgetArgs.push(url);
 
-            // Create empty file so progress checker works
             fs.writeFileSync(tempFilePath, '');
 
-            const curlProcess = spawn('curl', curlArgs);
+            const wgetProcess = spawn('wget', wgetArgs);
 
             let lastReportTime = Date.now();
             let lastLoaded = 0;
@@ -266,7 +305,7 @@ app.post('/start-upload', async (req, res) => {
                         const now = Date.now();
                         const elapsedSec = (now - lastReportTime) / 1000;
                         
-                        if (elapsedSec >= 0.5) { // update every half second
+                        if (elapsedSec > 0) {
                             const bytesDiff = loaded - lastLoaded;
                             if (bytesDiff >= 0) {
                                 const currentSpeed = bytesDiff / elapsedSec;
@@ -288,22 +327,22 @@ app.post('/start-upload', async (req, res) => {
                         }
                     }
                 } catch(e) {}
-            }, 500);
+            }, 1000);
 
             abortController.signal.addEventListener('abort', () => {
-                curlProcess.kill('SIGKILL');
+                wgetProcess.kill('SIGKILL');
             });
 
             await new Promise((resolve, reject) => {
-                curlProcess.on('close', (code) => {
+                wgetProcess.on('close', (code) => {
                     clearInterval(progressInterval);
-                    if (code === 0 || code === 33) { // 33 is HTTP range error (already downloaded)
+                    if (code === 0) {
                         resolve();
                     } else {
-                        reject(new Error(`Download failed (curl exit code ${code})`));
+                        reject(new Error(`Download failed (wget exit code ${code})`));
                     }
                 });
-                curlProcess.on('error', (err) => {
+                wgetProcess.on('error', (err) => {
                     clearInterval(progressInterval);
                     reject(err);
                 });
@@ -312,8 +351,19 @@ app.post('/start-upload', async (req, res) => {
             const fileSize = fs.existsSync(tempFilePath) ? fs.statSync(tempFilePath).size : 0;
             if (fileSize === 0) throw new Error('Downloaded file is empty or failed');
 
-            const fileUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
-            activeUploads.set(uploadId, { url: url, status: 'done', filename: actualFileName, size: fileSize, fileUrl: fileUrl, _startTime: Date.now() });
+            const streamUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
+            const downloadUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}?download=true`;
+            
+            activeUploads.set(uploadId, { 
+                url: url, 
+                status: 'done', 
+                filename: actualFileName, 
+                size: fileSize, 
+                fileUrl: streamUrl,
+                streamUrl: streamUrl,
+                downloadUrl: downloadUrl,
+                _startTime: Date.now() 
+            });
             abortControllers.delete(uploadId);
 
         } catch (error) {
