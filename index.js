@@ -29,6 +29,7 @@ setInterval(() => {
         }
     });
 
+    // 24 hours file auto-delete
     const tmpDir = os.tmpdir();
     try {
         fs.readdirSync(tmpDir).forEach(file => {
@@ -113,6 +114,7 @@ app.post('/cancel', (req, res) => {
         const currentData = activeUploads.get(uploadId) || {};
         activeUploads.set(uploadId, { ...currentData, status: 'error', message: 'Cancelled by user', _startTime: Date.now(), speed: 0 });
         
+        // Permanently delete file immediately
         const tmpDir = os.tmpdir();
         try {
             fs.readdirSync(tmpDir).forEach(file => {
@@ -212,10 +214,33 @@ app.post('/start-upload', async (req, res) => {
             let totalDownloadSize = 0;
             let downloadHeaders = {};
             try {
-                const headRes = await axios.head(url, { signal: abortController.signal, timeout: 30000 });
+                // Try HEAD request first
+                const headRes = await axios.head(url, { 
+                    signal: abortController.signal, 
+                    timeout: 30000,
+                    headers: useProxy ? {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': '*/*'
+                    } : {}
+                });
                 totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
                 downloadHeaders = headRes.headers;
-            } catch (e) { }
+            } catch (e) {
+                // If HEAD fails (some servers block it), try a GET request and abort it immediately
+                try {
+                    const getRes = await axios.get(url, {
+                        responseType: 'stream',
+                        timeout: 30000,
+                        headers: useProxy ? {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': '*/*'
+                        } : {}
+                    });
+                    totalDownloadSize = parseInt(getRes.headers['content-length'] || 0);
+                    downloadHeaders = getRes.headers;
+                    getRes.data.destroy(); // Abort the stream immediately
+                } catch (err) {}
+            }
 
             let originalFilename = getFilenameFromUrl(url, downloadHeaders);
             if (!originalFilename) {
@@ -275,7 +300,7 @@ app.post('/start-upload', async (req, res) => {
                                     url: url,
                                     status: 'Downloading to Server', 
                                     loaded: loaded, 
-                                    total: totalDownloadSize > 0 ? totalDownloadSize : loaded, 
+                                    total: totalDownloadSize || loaded, 
                                     speed: avgSpeed, 
                                     _startTime: startTime 
                                 });
@@ -310,7 +335,7 @@ app.post('/start-upload', async (req, res) => {
             if (fileSize === 0) throw new Error('Downloaded file is empty or failed');
 
             const fileUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
-            activeUploads.set(uploadId, { url: url, status: 'done', filename: actualFileName, size: fileSize, fileUrl: fileUrl, _startTime: Date.now(), total: totalDownloadSize > 0 ? totalDownloadSize : fileSize, loaded: fileSize });
+            activeUploads.set(uploadId, { url: url, status: 'done', filename: actualFileName, size: fileSize, fileUrl: fileUrl, _startTime: Date.now() });
             abortControllers.delete(uploadId);
 
         } catch (error) {
