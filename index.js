@@ -173,52 +173,10 @@ app.get('/status', (req, res) => {
 
 app.get('/f/:filename', (req, res) => {
     const p = path.join(os.tmpdir(), req.params.filename);
-    if (!fs.existsSync(p)) {
-        return res.status(404).send('File not found or expired');
-    }
-    
-    if (req.query.download === 'true') {
-        return res.download(p);
-    }
-
-    const stat = fs.statSync(p);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
-    let contentType = 'application/octet-stream';
-    if (req.params.filename.endsWith('.mp4')) contentType = 'video/mp4';
-    else if (req.params.filename.endsWith('.mkv')) contentType = 'video/x-matroska';
-    else if (req.params.filename.endsWith('.webm')) contentType = 'video/webm';
-
-    if (range) {
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-        if (start >= fileSize) {
-            res.status(416).send('Requested range not satisfiable\n'+start+' >= '+fileSize);
-            return;
-        }
-
-        const chunksize = (end - start) + 1;
-        const file = fs.createReadStream(p, {start, end});
-        const head = {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunksize,
-            'Content-Type': contentType,
-        };
-
-        res.writeHead(206, head);
-        file.pipe(res);
+    if (fs.existsSync(p)) {
+        res.sendFile(p);
     } else {
-        const head = {
-            'Content-Length': fileSize,
-            'Content-Type': contentType,
-            'Accept-Ranges': 'bytes'
-        };
-        res.writeHead(200, head);
-        fs.createReadStream(p).pipe(res);
+        res.status(404).send('File not found or expired');
     }
 });
 
@@ -251,20 +209,38 @@ app.post('/start-upload', async (req, res) => {
     (async () => {
         let tempFilePath = '';
         try {
+            let actualUrl = url;
+            
+            // Handle GoFile and other direct download links by checking for redirects
+            try {
+                const checkRes = await axios.head(url, { 
+                    maxRedirects: 0, 
+                    validateStatus: status => status >= 200 && status < 400 
+                });
+                if (checkRes.headers && checkRes.headers.location) {
+                    actualUrl = checkRes.headers.location;
+                }
+            } catch(e) {
+                if (e.response && e.response.headers && e.response.headers.location) {
+                    actualUrl = e.response.headers.location;
+                }
+            }
+
             let totalDownloadSize = 0;
             let downloadHeaders = {};
             try {
-                const headRes = await axios.head(url, { signal: abortController.signal, timeout: 30000 });
+                const headRes = await axios.head(actualUrl, { signal: abortController.signal, timeout: 30000 });
                 totalDownloadSize = parseInt(headRes.headers['content-length'] || 0);
                 downloadHeaders = headRes.headers;
             } catch (e) { }
 
-            let originalFilename = getFilenameFromUrl(url, downloadHeaders);
+            let originalFilename = getFilenameFromUrl(actualUrl, downloadHeaders);
             if (!originalFilename) {
                 const ct = downloadHeaders['content-type'] || '';
                 if (ct.includes('video/mp4')) originalFilename = 'video.mp4';
                 else if (ct.includes('video/x-matroska')) originalFilename = 'video.mkv';
                 else if (ct.includes('application/zip')) originalFilename = 'file.zip';
+                else if (ct.includes('application/vnd.android.package-archive')) originalFilename = 'app.apk';
                 else originalFilename = 'file.bin';
             }
             const safeFilename = originalFilename.replace(/[^a-zA-Z0-9.-]/g, '_');
@@ -281,14 +257,19 @@ app.post('/start-upload', async (req, res) => {
                 '-O', tempFilePath 
             ];
 
+            // For GoFile we must send a fake User-Agent and follow cookies if any
+            wgetArgs.push('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+            if (actualUrl.includes('gofile.io')) {
+                wgetArgs.push('--header=Cookie: accountToken=guest');
+            }
+            
             if (useProxy) {
-                wgetArgs.push('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 try {
-                    wgetArgs.push(`--referer=${new URL(url).origin}/`);
+                    wgetArgs.push(`--referer=${new URL(actualUrl).origin}/`);
                 } catch(e) {}
             }
             
-            wgetArgs.push(url);
+            wgetArgs.push(actualUrl);
 
             fs.writeFileSync(tempFilePath, '');
 
@@ -349,21 +330,23 @@ app.post('/start-upload', async (req, res) => {
             });
 
             const fileSize = fs.existsSync(tempFilePath) ? fs.statSync(tempFilePath).size : 0;
+            
+            // If the file is just an HTML page (like a GoFile block page), it failed
+            if (fileSize < 100000) { // Less than 100KB, check if it's HTML
+                try {
+                    const content = fs.readFileSync(tempFilePath, 'utf8');
+                    if (content.includes('<!DOCTYPE html>') || content.includes('<html')) {
+                        throw new Error('Received HTML instead of file. Link might be protected or expired.');
+                    }
+                } catch(e) {
+                    if (e.message.includes('Received HTML')) throw e;
+                }
+            }
+            
             if (fileSize === 0) throw new Error('Downloaded file is empty or failed');
 
-            const streamUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
-            const downloadUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}?download=true`;
-            
-            activeUploads.set(uploadId, { 
-                url: url, 
-                status: 'done', 
-                filename: actualFileName, 
-                size: fileSize, 
-                fileUrl: streamUrl,
-                streamUrl: streamUrl,
-                downloadUrl: downloadUrl,
-                _startTime: Date.now() 
-            });
+            const fileUrl = `${req.protocol}://${req.get('host')}/f/${actualFileName}`;
+            activeUploads.set(uploadId, { url: url, status: 'done', filename: actualFileName, size: fileSize, fileUrl: fileUrl, _startTime: Date.now() });
             abortControllers.delete(uploadId);
 
         } catch (error) {
