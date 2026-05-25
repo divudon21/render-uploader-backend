@@ -1,7 +1,7 @@
 {
   "name": "render-uploader-backend",
-  "version": "1.0.0",
-  "description": "Backend for URL Uploader App",
+  "version": "2.0.0",
+  "description": "Do It - yt-dlp Video/Audio Downloader + File Uploader Backend for Render",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
