@@ -7,6 +7,16 @@ const { v4: uuidv4 } = require('uuid');
 const { exec, spawn } = require('child_process');
 
 const app = express();
+// Enable CORS for all routes so app can hit it easily
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
 app.use(express.json());
 
 const activeUploads = new Map();
