@@ -202,26 +202,25 @@ app.post('/start-upload', async (req, res) => {
             let startTime = Date.now();
             activeUploads.set(uploadId, { status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: startTime });
 
-            // Use curl for robust downloading with retries and resume support
-            const curlArgs = [
-                '-L', // Follow redirects
-                '--retry', '10', // Retry up to 10 times on errors
-                '--retry-delay', '2', // Wait 2 seconds between retries
-                '-C', '-', // Automatically resume if connection drops
-                '-o', tempFilePath
+            // Using wget because it's extremely memory efficient for large files and writes directly to disk
+            // It completely bypasses Node.js memory limits.
+            const wgetArgs = [
+                '-c', // Continue getting a partially-downloaded file
+                '-t', '10', // Retry 10 times
+                '--waitretry=2', // Wait 2s between retries
+                '-O', tempFilePath // Output file
             ];
 
             if (useProxy) {
-                curlArgs.push('-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-                curlArgs.push('-H', 'Accept: */*');
+                wgetArgs.push('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 try {
-                    curlArgs.push('-H', `Referer: ${new URL(url).origin}/`);
+                    wgetArgs.push(`--referer=${new URL(url).origin}/`);
                 } catch(e) {}
             }
             
-            curlArgs.push(url);
+            wgetArgs.push(url);
 
-            const curlProcess = spawn('curl', curlArgs);
+            const wgetProcess = spawn('wget', wgetArgs);
 
             let lastReportTime = Date.now();
             let lastLoaded = 0;
@@ -248,22 +247,22 @@ app.post('/start-upload', async (req, res) => {
                         });
                     }
                 } catch(e) {}
-            }, 500);
+            }, 1000); // Polling every 1s instead of 500ms to save CPU
 
             abortController.signal.addEventListener('abort', () => {
-                curlProcess.kill('SIGKILL');
+                wgetProcess.kill('SIGKILL');
             });
 
             await new Promise((resolve, reject) => {
-                curlProcess.on('close', (code) => {
+                wgetProcess.on('close', (code) => {
                     clearInterval(progressInterval);
-                    if (code === 0 || code === 33) { // 33 means file already fully downloaded (Range error)
+                    if (code === 0) {
                         resolve();
                     } else {
-                        reject(new Error(`Download failed (curl exit code ${code})`));
+                        reject(new Error(`Download failed (wget exit code ${code})`));
                     }
                 });
-                curlProcess.on('error', (err) => {
+                wgetProcess.on('error', (err) => {
                     clearInterval(progressInterval);
                     reject(err);
                 });
