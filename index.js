@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 
 const app = express();
 app.use(express.json());
@@ -187,31 +187,9 @@ app.post('/start-upload', async (req, res) => {
                 downloadHeaders = headRes.headers;
             } catch (e) { /* HEAD may fail, continue */ }
 
-            const downloadConfig = {
-                url, method: 'GET', responseType: 'stream',
-                signal: abortController.signal, timeout: 0, maxContentLength: Infinity, maxBodyLength: Infinity,
-                maxRedirects: 10
-            };
-
-            if (useProxy) {
-                downloadConfig.headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': '*/*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Referer': new URL(url).origin + '/',
-                    'Connection': 'keep-alive'
-                };
-            }
-
-            const response = await axios(downloadConfig);
-
-            if (totalDownloadSize === 0) totalDownloadSize = parseInt(response.headers['content-length'] || 0);
-            if (!downloadHeaders['content-disposition']) downloadHeaders = response.headers;
-            
             let originalFilename = getFilenameFromUrl(url, downloadHeaders);
             if (!originalFilename) {
-                const ct = response.headers['content-type'] || '';
+                const ct = downloadHeaders['content-type'] || '';
                 if (ct.includes('video/mp4')) originalFilename = 'video.mp4';
                 else if (ct.includes('video/x-matroska')) originalFilename = 'video.mkv';
                 else if (ct.includes('application/zip')) originalFilename = 'file.zip';
@@ -221,33 +199,79 @@ app.post('/start-upload', async (req, res) => {
             const actualFileName = `upload_${uploadId}_${safeFilename}`;
             tempFilePath = path.join(os.tmpdir(), actualFileName);
 
-            let downloadedBytes = 0;
             let startTime = Date.now();
+            activeUploads.set(uploadId, { status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: startTime });
+
+            // Use curl for robust downloading with retries and resume support
+            const curlArgs = [
+                '-L', // Follow redirects
+                '--retry', '10', // Retry up to 10 times on errors
+                '--retry-delay', '2', // Wait 2 seconds between retries
+                '-C', '-', // Automatically resume if connection drops
+                '-o', tempFilePath
+            ];
+
+            if (useProxy) {
+                curlArgs.push('-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+                curlArgs.push('-H', 'Accept: */*');
+                try {
+                    curlArgs.push('-H', `Referer: ${new URL(url).origin}/`);
+                } catch(e) {}
+            }
+            
+            curlArgs.push(url);
+
+            const curlProcess = spawn('curl', curlArgs);
+
             let lastReportTime = Date.now();
+            let lastLoaded = 0;
 
-            activeUploads.set(uploadId, { status: 'Downloading to Server', loaded: 0, total: totalDownloadSize, speed: 0, _startTime: Date.now() });
+            const progressInterval = setInterval(() => {
+                try {
+                    if (fs.existsSync(tempFilePath)) {
+                        const loaded = fs.statSync(tempFilePath).size;
+                        const now = Date.now();
+                        const elapsedSec = (now - lastReportTime) / 1000;
+                        let speed = 0;
+                        if (elapsedSec > 0 && loaded >= lastLoaded) {
+                            speed = (loaded - lastLoaded) / elapsedSec;
+                        }
+                        lastLoaded = loaded;
+                        lastReportTime = now;
+                        
+                        activeUploads.set(uploadId, { 
+                            status: 'Downloading to Server', 
+                            loaded: loaded, 
+                            total: totalDownloadSize || loaded, // fallback to loaded if total is unknown
+                            speed: speed, 
+                            _startTime: startTime 
+                        });
+                    }
+                } catch(e) {}
+            }, 500);
 
-            response.data.on('data', (chunk) => {
-                downloadedBytes += chunk.length;
-                const now = Date.now();
-                if (now - lastReportTime > 300) {
-                    const elapsed = (now - startTime) / 1000;
-                    const speed = elapsed > 0 ? downloadedBytes / elapsed : 0;
-                    activeUploads.set(uploadId, { status: 'Downloading to Server', loaded: downloadedBytes, total: totalDownloadSize || 0, speed, _startTime: startTime });
-                    lastReportTime = now;
-                }
+            abortController.signal.addEventListener('abort', () => {
+                curlProcess.kill('SIGKILL');
             });
-
-            const writer = fs.createWriteStream(tempFilePath);
-            response.data.pipe(writer);
 
             await new Promise((resolve, reject) => {
-                writer.on('finish', resolve);
-                writer.on('error', reject);
-                abortController.signal.addEventListener('abort', () => { writer.destroy(); reject(new Error('Cancelled')); });
+                curlProcess.on('close', (code) => {
+                    clearInterval(progressInterval);
+                    if (code === 0 || code === 33) { // 33 means file already fully downloaded (Range error)
+                        resolve();
+                    } else {
+                        reject(new Error(`Download failed (curl exit code ${code})`));
+                    }
+                });
+                curlProcess.on('error', (err) => {
+                    clearInterval(progressInterval);
+                    reject(err);
+                });
             });
 
-            const fileSize = fs.statSync(tempFilePath).size;
+            const fileSize = fs.existsSync(tempFilePath) ? fs.statSync(tempFilePath).size : 0;
+            if (fileSize === 0) throw new Error('Downloaded file is empty or failed');
+
             console.log(`Downloaded ${actualFileName} successfully (${fileSize} bytes) and stored locally.`);
 
             // Link generation & success
